@@ -10,6 +10,7 @@ import time
 import ssl
 import urllib3
 import os
+from streamlit_autorefresh import st_autorefresh
 
 # Mematikan peringatan SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -25,7 +26,7 @@ st.set_page_config(page_title="Howen Fleet VSS", page_icon="🛰️", layout="wi
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 
-# Konfigurasi Akun Dummy
+# Konfigurasi Akun Dummy untuk UI Login
 USER_DUMMY = "admin"
 PASS_DUMMY = "admin123"
 
@@ -37,8 +38,8 @@ HTTP_LOGIN_URL = "https://mdvr.mceasy.com/vss/user/apiLogin.action"
 HTTP_FIND_ALL_URL = "https://mdvr.mceasy.com/vss/vehicle/findAll.action"
 WS_URL = "ws://mdvr.mceasy.com:36300/ws"
 
-USERNAME = "MEP-PROD"
-RAW_PASSWORD = "Vss-Mep-2025!"
+USERNAME = "admin"
+RAW_PASSWORD = "Fadli080597#" # Jangan lupa isi kembali password API aslimu
 SESSION_FILE = "vss_session.json"
 TARGET_FLEET_ID = "" 
 
@@ -49,6 +50,8 @@ target_devices = []
 def init_db():
     try:
         conn = sqlite3.connect(DB_NAME)
+        # Mengaktifkan WAL mode agar SQLite tidak terkunci saat read/write bersamaan
+        conn.execute('PRAGMA journal_mode=WAL;') 
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS realtime_data (
@@ -77,6 +80,17 @@ def save_to_db(device_id, action_type, payload):
         conn.close()
     except Exception as e:
         pass 
+
+def get_total_devices_global():
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(DISTINCT device_id) FROM realtime_data")
+        total = cursor.fetchone()[0]
+        conn.close()
+        return total
+    except:
+        return 0
 
 def get_md5_password(password):
     return hashlib.md5(password.encode()).hexdigest()
@@ -131,6 +145,7 @@ def get_devices_by_fleet():
         if result.get("status") == 10000:
             data_list = result.get("data", {}).get("dataList", [])
             target_devices = [str(device.get("deviceno")) for device in data_list]
+            print(f"[API] Berhasil menarik {len(target_devices)} device target dari Fleet ID.") 
             return True
         return False
     except:
@@ -149,7 +164,8 @@ def on_message(ws, message):
         
         device_id = ""
         if isinstance(payload_data, dict):
-            device_id = str(payload_data.get("deviceID", payload_data.get("deviceno", "")))
+            # Validasi format key device id dari Howen
+            device_id = str(payload_data.get("deviceID", payload_data.get("deviceno", payload_data.get("deviceNo", ""))))
             
         if target_devices and device_id and device_id not in target_devices:
             return 
@@ -195,12 +211,10 @@ def load_data():
 # 3. KONTROL TAMPILAN BERDASARKAN STATUS LOGIN
 # ==========================================
 
-# JIKA BELUM LOGIN -> TAMPILKAN HALAMAN LOGIN
 if not st.session_state["logged_in"]:
     st.markdown("<h1 style='text-align: center;'>🔒 Dashboard Raw Data Howen</h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align: center;'>Silakan login untuk mengakses dashboard.</p>", unsafe_allow_html=True)
     
-    # Membuat form login di tengah menggunakan kolom
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
         with st.form("form_login"):
@@ -211,13 +225,11 @@ if not st.session_state["logged_in"]:
             if submit_btn:
                 if input_user == USER_DUMMY and input_pass == PASS_DUMMY:
                     st.session_state["logged_in"] = True
-                    st.rerun() # Refresh halaman untuk masuk ke dashboard
+                    st.rerun() 
                 else:
                     st.error("❌ Username atau Password salah!")
 
-# JIKA SUDAH LOGIN -> TAMPILKAN DASHBOARD UTAMA
 else:
-    # Jalankan background worker HANYA setelah user login
     is_connected = start_background_worker()
 
     st.markdown("""
@@ -236,23 +248,39 @@ else:
         st.image("https://cdn-icons-png.flaticon.com/512/854/854878.png", width=80) 
         st.title("🎛️ Panel Kontrol")
         
+        # --- FITUR BARU: AUTO REFRESH ---
+        st.markdown("### ⏱️ Pengaturan Live Update")
+        auto_refresh = st.checkbox("Aktifkan Auto-Refresh", value=True, help="Centang untuk refresh data otomatis")
+        
+        if auto_refresh:
+            refresh_interval = st.slider("Interval Refresh (Detik)", min_value=2, max_value=60, value=5)
+            # st_autorefresh membutuhkan input dalam milidetik (detik * 1000)
+            st_autorefresh(interval=refresh_interval * 1000, key="data_refresher")
+        else:
+            st.info("Auto-Refresh nonaktif. Tekan tombol di bawah untuk refresh manual.")
+
         st.markdown("### 🔍 Filter Pencarian")
         if not df.empty:
-            device_list = ["Semua"] + df['device_id'].astype(str).dropna().unique().tolist()
-            selected_device = st.selectbox("Pilih Device ID:", device_list)
+            # Pembersihan data dari desimal/float dan spasi
+            df['device_id'] = df['device_id'].astype(str).str.strip().str.replace('.0', '', regex=False)
+            df['action_type'] = df['action_type'].astype(str).str.strip().str.replace('.0', '', regex=False)
+
+            # Sorting list dropdown agar rapi
+            device_list = ["Semua"] + sorted(df['device_id'].unique().tolist())
+            selected_device = st.selectbox("Pilih Device ID:", device_list, key="filter_device")
             
             action_list = ["Semua", "80003 (GPS/Status)", "80004 (Alarm)", "80005 (Online/Offline)"]
-            selected_action = st.selectbox("Pilih Tipe Event:", action_list)
+            selected_action = st.selectbox("Pilih Tipe Event:", action_list, key="filter_action")
             
             st.markdown("---")
-            if st.button("🔄 Segarkan Data", use_container_width=True):
+            # Tombol refresh manual tetap dipertahankan sebagai cadangan
+            if st.button("🔄 Segarkan Manual", use_container_width=True):
                 st.rerun()
         else:
             st.warning("Menunggu data masuk...")
             if st.button("🔄 Cek Data", use_container_width=True):
                 st.rerun()
 
-        # Tombol Logout diletakkan di paling bawah sidebar
         st.markdown("<br><br>", unsafe_allow_html=True)
         if st.button("🚪 Keluar (Logout)", type="primary", use_container_width=True):
             st.session_state["logged_in"] = False
@@ -261,18 +289,21 @@ else:
     # --- KONTEN UTAMA DASHBOARD ---
     if not df.empty:
         filtered_df = df.copy()
+        
+        # Terapkan filter berdasarkan input pengguna
         if selected_device != "Semua":
-            filtered_df = filtered_df[filtered_df['device_id'].astype(str) == selected_device]
+            filtered_df = filtered_df[filtered_df['device_id'] == selected_device]
         if selected_action != "Semua":
             action_code = selected_action.split(" ")[0]
-            filtered_df = filtered_df[filtered_df['action_type'].astype(str) == action_code]
+            filtered_df = filtered_df[filtered_df['action_type'] == action_code]
 
         col1, col2, col3, col4 = st.columns(4)
-        total_devices = df['device_id'].nunique()
+        
+        total_devices_all = get_total_devices_global() 
         total_events = len(filtered_df)
         
-        col1.metric("📡 Total Device Aktif", f"{total_devices} Unit")
-        col2.metric("💾 Data di Database", f"{len(df)} Baris")
+        col1.metric("📡 Total Device Aktif", f"{total_devices_all} Unit")
+        col2.metric("💾 Data Top 1000 DB", f"{len(df)} Baris")
         col3.metric("📊 Data Sesuai Filter", f"{total_events} Baris")
         col4.metric("🟢 Status Koneksi", "Online", delta="Stabil", delta_color="normal")
 
@@ -281,13 +312,13 @@ else:
         tab1, tab2, tab3 = st.tabs(["📈 Ringkasan Visual", "📋 Tabel Data Lengkap", "🛠️ Inspeksi JSON Payload"])
 
         with tab1:
-            st.subheader("Distribusi Event per Device")
+            st.subheader("Distribusi Event per Device (Top 1000)")
             if not filtered_df.empty:
                 chart_data = filtered_df['device_id'].value_counts().reset_index()
                 chart_data.columns = ['Device ID', 'Jumlah Event']
                 st.bar_chart(chart_data, x="Device ID", y="Jumlah Event", color="#1E88E5", use_container_width=True)
             else:
-                st.info("Tidak ada data untuk ditampilkan pada grafik.")
+                st.info("Tidak ada data untuk ditampilkan pada grafik sesuai filter.")
 
         with tab2:
             st.subheader("Tabel Rekaman Real-Time")
@@ -308,7 +339,7 @@ else:
             st.subheader("Bongkar Data Payload (Detail JSON)")
             col_input, col_space = st.columns([1, 3])
             with col_input:
-                row_id = st.number_input("Masukkan ID Baris:", min_value=1, step=1)
+                row_id = st.number_input("Masukkan ID Baris (ID DB):", min_value=1, step=1)
             
             if row_id:
                 detail_data = df[df['id'].astype(str) == str(row_id)]
@@ -320,6 +351,6 @@ else:
                     except:
                         st.code(raw_payload, language="text")
                 else:
-                    st.error(f"❌ Data dengan ID {row_id} tidak ditemukan.")
+                    st.error(f"❌ Data dengan ID {row_id} tidak ditemukan dalam 1000 data terakhir.")
     else:
         st.info("⏳ Menunggu data masuk dari WebSocket...")
